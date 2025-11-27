@@ -1,4 +1,4 @@
-name: 加速版构建 6.1.118 欧加真OKI内核（仅SukiSU）
+name: 加速版构建 6.1.118 欧加真OKI内核
 
 env:
   TZ: Asia/Shanghai
@@ -31,7 +31,7 @@ on:
         description: '内核后缀(留空默认,开头别加连字符,勿加空格等影响指令运行的保留字符)'
         required: false
         type: string
-        default: ''
+        default: 'H'
 
 jobs:
   build:
