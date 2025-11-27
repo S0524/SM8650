@@ -125,7 +125,7 @@ jobs:
           cd ./common
           patch -p1 < 69_hide_stuff.patch || true
 
-      - name: 应用lz4 1.10.0补丁（仅保留lz4）
+      - name: 应用lz4 1.10.0补丁
         run: |
           echo "正在添加lz4 1.10.0补丁…"
           cd kernel_workspace
