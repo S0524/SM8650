@@ -7,7 +7,42 @@ env:
   KERNEL_NAME: 'android14-11-o-gca13bffobf09'
 
 on:
-  workflow_dispatch: 
+  workflow_dispatch:
+    inputs:
+      lz4_enable:
+        description: '是否安装 lz4 1.10.0 补丁(0=不安装,1=安装lz4补丁,默认1)'
+        required: true
+        type: choice
+        default: '1'
+        options:
+          - '0'
+          - '1'
+      better_net:
+        description: '是否开启网络功能拓展配置(用于为ipset及需要iptables等高级网络功能内核支持的程序提供支持)'
+        required: true
+        type: choice
+        default: 'true'
+        options:
+          - 'true'
+          - 'false'
+      ssg_rekernel_enable:
+        description: '是否启用三星SSG IO调度器及Re-Kernel支持(0=均不安装,1=均安装,默认1)'
+        required: true
+        type: choice
+        default: '1'
+        options:
+          - '0'
+          - '1'
+      baseband_guard:
+        description: '是否开启内核级基带保护(阻止一切对非用户分区的写入，有效防止格机)'
+        required: true
+        type: boolean
+        default: 'true'
+      kernel_suffix:
+        description: '内核后缀(留空默认,开头别加连字符,勿加空格等影响指令运行的保留字符)'
+        required: false
+        type: string
+        default: ''
 
 jobs:
   build:
@@ -26,6 +61,7 @@ jobs:
           sudo apt purge man-db &&
           sudo rm -rf /var/lib/man-db/auto-update &&
           sudo apt update &&
+          # 移除ccache依赖
           sudo apt-get install -y --no-install-recommends binutils python-is-python3 libssl-dev libelf-dev &
           
           echo "正在克隆源码仓库..."
@@ -46,169 +82,281 @@ jobs:
           rm -rf build-tools.zip &
           
           wait
-          echo "所有源码及工具链初始化完成！"
-          echo "去除 ABI 保护 & dirty 后缀..."
+          echo "所有源码及llvm-Clang20工具链初始化完成！"
+          echo "正在去除 ABI 保护 & 去除 dirty 后缀..."
           rm common/android/abi_gki_protected_exports_* || true
           for f in common/scripts/setlocalversion; do
             sed -i 's/ -dirty//g' "$f"
             sed -i '$i res=$(echo "$res" | sed '\''s/-dirty//g'\'')' "$f"
           done
 
-      - name: 添加KernelSU（SukiSU Ultra）
+      - name: 添加SukiSU Ultra
         id: ksu_version
         run: |
           cd kernel_workspace
-          echo "配置SukiSU Ultra..."
-          curl -LSs "https://raw.githubusercontent.com/ShirkNeko/SukiSU-Ultra/refs/heads/main/kernel/setup.sh" | bash -s susfs-main
+          echo "正在配置SukiSU Ultra..."
+          curl -LSs "https://raw.githubusercontent.com/ShirkNeko/SukiSU-Ultra/refs/heads/main/kernel/setup.sh" | bash -s main
           cd ./KernelSU
           GIT_COMMIT_HASH=$(git rev-parse --short=8 HEAD)
-          # 获取KSU API版本号
+          echo "当前提交哈希: $GIT_COMMIT_HASH"
+          
+          # 尝试最多 3 次获取 KernelSU API 版本号
           for i in {1..3}; do
-            KSU_API_VERSION=$(curl -s "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/susfs-main/kernel/Makefile" | 
-              grep -m1 "KSU_VERSION_API :=" | awk -F'= ' '{print $2}' | tr -d '[:space:]')
+            KSU_API_VERSION=$(curl -s "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/Makefile" | 
+              grep -m1 "KSU_VERSION_API :=" | 
+              awk -F'= ' '{print $2}' | 
+              tr -d '[:space:]')
             [ -n "$KSU_API_VERSION" ] && break || sleep 1
           done
           [ -z "$KSU_API_VERSION" ] && KSU_API_VERSION="3.1.7"
           echo "KSU_API_VERSION=$KSU_API_VERSION" >> $GITHUB_ENV
-          # 写入版本定义
+          
+          # 创建版本定义模板
           VERSION_DEFINITIONS=$'define get_ksu_version_full\nv\\$1-'"$GIT_COMMIT_HASH"$'@cctv18\nendef\n\nKSU_VERSION_API := '"$KSU_API_VERSION"$'\nKSU_VERSION_FULL := v'"$KSU_API_VERSION"$'-'"$GIT_COMMIT_HASH"$'@cctv18'
+          
+          # 清理内核 Makefile 中的旧版本定义
           sed -i '/define get_ksu_version_full/,/endef/d' kernel/Makefile
           sed -i '/KSU_VERSION_API :=/d' kernel/Makefile
           sed -i '/KSU_VERSION_FULL :=/d' kernel/Makefile
-          awk -v def="$VERSION_DEFINITIONS" '/REPO_OWNER :=/ {print; print def; inserted=1; next} 1; END {if (!inserted) print def}' kernel/Makefile > kernel/Makefile.tmp && mv kernel/Makefile.tmp kernel/Makefile
-          # 生成版本号
+          
+          # 在 REPO_OWNER 行后插入新版本定义
+          awk -v def="$VERSION_DEFINITIONS" '
+            /REPO_OWNER :=/ {print; print def; inserted=1; next}
+            1
+            END {if (!inserted) print def}
+          ' kernel/Makefile > kernel/Makefile.tmp && mv kernel/Makefile.tmp kernel/Makefile
+
+          # 生成自定义版本号
           KSU_VERSION=$(expr $(git rev-list --count main) + 37185 2>/dev/null || echo 114514)
           echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
           echo "ksuver=$KSU_VERSION" >> $GITHUB_OUTPUT
 
-      - name: 应用SukiSU基础补丁
-        run: |
-          cd kernel_workspace
-          git clone https://github.com/ShirkNeko/SukiSU_patch.git
-          cp ./SukiSU_patch/69_hide_stuff.patch ./common/
-          cd ./common
-          patch -p1 < 69_hide_stuff.patch || true
+          # 验证修改结果
+          grep -A10 "REPO_OWNER" kernel/Makefile
+          grep "KSU_VERSION_FULL" kernel/Makefile
+          echo "SukiSU版本号: v${KSU_API_VERSION}-${GIT_COMMIT_HASH}@cctv18"
 
-      - name: 应用lz4
+      - name: 应用lz4 1.10.0补丁
         run: |
-          cd kernel_workspace
-          git clone https://github.com/cctv18/oppo_oplus_realme_sm8650.git
-          cp ./oppo_oplus_realme_sm8650/zram_patch/001-lz4.patch ./common/
-          cp ./oppo_oplus_realme_sm8650/zram_patch/lz4armv8.S ./common/lib
-          cd ./common
-          git apply -p1 < 001-lz4.patch || true
+          if [[ "${{ github.event.inputs.lz4_enable }}" == "1" ]]; then
+            echo "正在添加lz4 1.10.0补丁…"
+            cd kernel_workspace
+            git clone https://github.com/cctv18/oppo_oplus_realme_sm8650.git
+            cp ./oppo_oplus_realme_sm8650/zram_patch/001-lz4.patch ./common/
+            cp ./oppo_oplus_realme_sm8650/zram_patch/lz4armv8.S ./common/lib
+            cd ./common
+            git apply -p1 < 001-lz4.patch || true
+          fi
 
-      - name: 添加基础配置项
+      - name: 添加 KSU & 其他配置项
         run: |
           cd kernel_workspace
           echo "CONFIG_KSU=y" >> ./common/arch/arm64/configs/gki_defconfig
+          #添加对 Mountify 模块的支持
           echo "CONFIG_TMPFS_XATTR=y" >> ./common/arch/arm64/configs/gki_defconfig
           echo "CONFIG_TMPFS_POSIX_ACL=y" >> ./common/arch/arm64/configs/gki_defconfig
+          # 开启O2编译优化配置
           echo "CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y" >> ./common/arch/arm64/configs/gki_defconfig
+          #禁用 defconfig 检查
           sed -i 's/check_defconfig//' ./common/build.config.gki
+          #跳过将uapi标准头安装到 usr/include 目录
           echo "CONFIG_HEADERS_INSTALL=n" >> ./common/arch/arm64/configs/gki_defconfig
-
-      - name: 启用网络功能增强
+          
+      - name: 启用网络功能增强优化配置
         run: |
           cd kernel_workspace
-          echo "CONFIG_BPF_STREAM_PARSER=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_NETFILTER_XT_SET=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IP_SET=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IP_SET_MAX=65534" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IP_SET_BITMAP_IP=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IP_SET_BITMAP_IPMAC=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IP_SET_BITMAP_PORT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IP_SET_HASH_IP=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IP_SET_HASH_IPMARK=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IP_SET_HASH_IPPORT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IP_SET_HASH_IPPORTIP=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IP_SET_HASH_IPPORTNET=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IP_SET_HASH_IPMAC=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IP_SET_HASH_MAC=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IP_SET_HASH_NETPORTNET=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IP_SET_HASH_NET=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IP_SET_HASH_NETNET=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IP_SET_HASH_NETPORT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IP_SET_HASH_NETIFACE=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IP_SET_LIST_SET=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IP6_NF_NAT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IP6_NF_TARGET_MASQUERADE=y" >> ./common/arch/arm64/configs/gki_defconfig
-          # 修复vintf兼容性
-          cd common
-          wget https://github.com/cctv18/oppo_oplus_realme_sm8650/raw/refs/heads/main/other_patch/config.patch
-          patch -p1 -F 3 < config.patch || true
+          if [[ "${{ github.event.inputs.better_net }}" == "true" ]]; then
+            echo "CONFIG_BPF_STREAM_PARSER=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_NETFILTER_XT_SET=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_IP_SET=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_IP_SET_MAX=65534" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_IP_SET_BITMAP_IP=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_IP_SET_BITMAP_IPMAC=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_IP_SET_BITMAP_PORT=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_IP_SET_HASH_IP=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_IP_SET_HASH_IPMARK=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_IP_SET_HASH_IPPORT=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_IP_SET_HASH_IPPORTIP=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_IP_SET_HASH_IPPORTNET=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_IP_SET_HASH_IPMAC=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_IP_SET_HASH_MAC=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_IP_SET_HASH_NETPORTNET=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_IP_SET_HASH_NET=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_IP_SET_HASH_NETNET=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_IP_SET_HASH_NETPORT=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_IP_SET_HASH_NETIFACE=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_IP_SET_LIST_SET=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_IP6_NF_NAT=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_IP6_NF_TARGET_MASQUERADE=y" >> ./common/arch/arm64/configs/gki_defconfig
+            # 修复IPv6 NAT兼容性问题
+            cd common
+            wget https://github.com/cctv18/oppo_oplus_realme_sm8650/raw/refs/heads/main/other_patch/config.patch
+            patch -p1 -F 3 < config.patch || true
+          fi
 
-      - name: 启用SSG IO调度器及Re-Kernel
+      - name: 启用三星SSG IO调度器
         run: |
-          cd kernel_workspace
-          echo "CONFIG_MQ_IOSCHED_SSG=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_MQ_IOSCHED_SSG_CGROUP=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_REKERNEL=y" >> ./common/arch/arm64/configs/gki_defconfig
+          if [[ "${{ github.event.inputs.ssg_rekernel_enable }}" == "1" ]]; then
+            echo "正在启用三星SSG IO调度器(一加12等极少数机型开启后可能不开机,若出现bug请关闭此项)…"
+            cd kernel_workspace
+            echo "CONFIG_MQ_IOSCHED_SSG=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_MQ_IOSCHED_SSG_CGROUP=y" >> ./common/arch/arm64/configs/gki_defconfig
+          fi
+
+      - name: 启用Re-Kernel支持
+        run: |
+          if [[ "${{ github.event.inputs.ssg_rekernel_enable }}" == "1" ]]; then
+            echo "正在启用Re-Kernel支持(用于与Freezer,NoActive等软件配合使用,提升冻结后台能力)…"
+            cd kernel_workspace
+            echo "CONFIG_REKERNEL=y" >> ./common/arch/arm64/configs/gki_defconfig
+          fi
 
       - name: 启用内核级基带保护
         run: |
-          cd kernel_workspace
-          echo "CONFIG_BBG=y" >> ./common/arch/arm64/configs/gki_defconfig
-          cd ./common/security
-          wget https://github.com/cctv18/Baseband-guard/archive/refs/heads/master.zip
-          unzip -q master.zip
-          mv "Baseband-guard-master" baseband-guard
-          printf '\nobj-$(CONFIG_BBG) += baseband-guard/\n' >> ./Makefile
-          sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/lockdown/lockdown,baseband_guard/ } }' ./Kconfig
-          awk '/endmenu/ {last_endmenu_line=NR} {lines[NR]=$0} END {for(i=1;i<=NR;i++){if(i==last_endmenu_line){sub(/endmenu/,"",lines[i]);print lines[i] "source \"security/baseband-guard/Kconfig\"";print "";print "endmenu"}else{print lines[i]}}}' ./Kconfig > Kconfig.tmp && mv Kconfig.tmp ./Kconfig
-          sed -i 's/selinuxfs.o //g' "./selinux/Makefile"
-          sed -i 's/hooks.o //g' "./selinux/Makefile"
-          cat "./baseband-guard/sepatch.txt" >> "./selinux/Makefile"
+          if [[ "${{ github.event.inputs.baseband_guard }}" == "true" ]]; then
+            echo "正在启用启用内核级基带保护支持…"
+            cd kernel_workspace
+            echo "CONFIG_BBG=y" >> ./common/arch/arm64/configs/gki_defconfig
+            cd ./common/security
+            wget https://github.com/cctv18/Baseband-guard/archive/refs/heads/master.zip
+            unzip -q master.zip
+            mv "Baseband-guard-master" baseband-guard
+            printf '\nobj-$(CONFIG_BBG) += baseband-guard/\n' >> ./Makefile
+            sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/lockdown/lockdown,baseband_guard/ } }' ./Kconfig
+            awk '
+            /endmenu/ { last_endmenu_line = NR }
+            { lines[NR] = $0 }
+            END {
+              for (i=1; i<=NR; i++) {
+                if (i == last_endmenu_line) {
+                  sub(/endmenu/, "", lines[i]);
+                  print lines[i] "source \"security/baseband-guard/Kconfig\""
+                  print ""
+                  print "endmenu"
+                } else {
+                    print lines[i]
+                }
+              }
+            }
+            ' ./Kconfig > Kconfig.tmp && mv Kconfig.tmp ./Kconfig
+            sed -i 's/selinuxfs.o //g' "./selinux/Makefile"
+            sed -i 's/hooks.o //g' "./selinux/Makefile"
+            cat "./baseband-guard/sepatch.txt" >> "./selinux/Makefile"
+          fi
 
-      - name: 设置内核后缀（硬编码为H）
+      - name: 添加制作名称
         run: |
           cd kernel_workspace
-          for f in ./common/scripts/setlocalversion; do
-            sed -i "\$s|echo \"\\\$res\"|echo \"-H\"|" "$f"
-          done
-
+          echo "替换内核版本后缀..."
+          if [[ -n "${{ github.event.inputs.kernel_suffix }}" ]]; then
+            echo "当前内核版本后缀：${{ github.event.inputs.kernel_suffix }}"
+            for f in ./common/scripts/setlocalversion; do
+              sed -i "\$s|echo \"\\\$res\"|echo \"-${{ github.event.inputs.kernel_suffix }}\"|" "$f"
+            done
+          else
+            echo "当前内核版本后缀：${{ env.KERNEL_NAME }}"
+            for f in ./common/scripts/setlocalversion; do
+              sed -i "\$s|echo \"\\\$res\"|echo \"-${{ env.KERNEL_NAME }}\"|" "$f"
+            done
+          fi
+           
       - name: 构建内核
         run: |
           WORKDIR="$(pwd)"
+          # 移除ccache相关PATH配置
           export PATH="$WORKDIR/kernel_workspace/clang20/bin:$PATH"
           export PATH="$WORKDIR/kernel_workspace/build-tools/bin:$PATH"
           CLANG_DIR="$WORKDIR/kernel_workspace/clang20/bin"
-          echo "编译器信息: $(clang --version | head -n 1)"
-          echo "LLD版本: $(ld.lld --version | head -n 1)"
+          CLANG_VERSION="$($CLANG_DIR/clang --version | head -n 1)"
+          LLD_VERSION="$($CLANG_DIR/ld.lld --version | head -n 1)"
+          echo "编译器信息:"
+          echo "Clang版本: $CLANG_VERSION"
+          echo "LLD版本: $LLD_VERSION"
+          pahole_version=$(pahole --version 2>/dev/null | head -n1); [ -z "$pahole_version" ] && echo "pahole版本：未安装" || echo "pahole版本：$pahole_version"
           
+          # 移除所有ccache相关环境变量
           cd kernel_workspace/common
           wget https://github.com/cctv18/oppo_oplus_realme_sm8650/raw/refs/heads/main/lib/libfakestat.so
           wget https://github.com/cctv18/oppo_oplus_realme_sm8650/raw/refs/heads/main/lib/libfaketimeMT.so
           chmod 777 ./*.so
           export FAKESTAT="2025-05-25 12:00:00"
           export FAKETIME="@2025-05-25 13:00:00"
+          echo "FAKESTAT=$FAKESTAT" >> $GITHUB_ENV
+          echo "FAKETIME=$FAKETIME" >> $GITHUB_ENV
           SO_DIR=$(pwd)
           export PRELOAD_LIBS="$SO_DIR/libfakestat.so $SO_DIR/libfaketimeMT.so"
-          # 创建编译器/链接器包装器
-          echo '#!/bin/bash' > cc-wrapper && echo 'export LD_PRELOAD="'$PRELOAD_LIBS'"' >> cc-wrapper && echo 'export FAKESTAT="'$FAKESTAT'"' >> cc-wrapper && echo 'export FAKETIME="'$FAKETIME'"' >> cc-wrapper && echo 'clang "$@"' >> cc-wrapper
-          echo '#!/bin/bash' > ld-wrapper && echo 'export LD_PRELOAD="'$PRELOAD_LIBS'"' >> ld-wrapper && echo 'export FAKESTAT="'$FAKESTAT'"' >> ld-wrapper && echo 'export FAKETIME="'$FAKETIME'"' >> ld-wrapper && echo 'ld.lld "$@"' >> ld-wrapper
-          chmod +x cc-wrapper ld-wrapper
-          # 测试时间劫持
-          echo '#!/bin/bash' > test-wrapper.sh && echo 'export LD_PRELOAD="'$PRELOAD_LIBS'"' >> test-wrapper.sh && echo 'export FAKESTAT="'$FAKESTAT'"' >> test-wrapper.sh && echo 'export FAKETIME="'$FAKETIME'"' >> test-wrapper.sh && echo 'exec "$@"' >> test-wrapper.sh && chmod +x test-wrapper.sh
-          ./test-wrapper.sh date && ./test-wrapper.sh stat ./Makefile
           
-          # 清理空间+编译
-          sudo rm -rf /usr/share/dotnet & sudo rm -rf /usr/local/lib/android & sudo rm -rf /opt/ghc & sudo rm -rf /opt/hostedtoolcache/CodeQL &
+          #创建 CC (编译器) 包装器（移除ccache）
+          echo '#!/bin/bash' > cc-wrapper
+          echo 'export LD_PRELOAD="'$PRELOAD_LIBS'"' >> cc-wrapper
+          echo 'export FAKESTAT="'$FAKESTAT'"' >> cc-wrapper
+          echo 'export FAKETIME="'$FAKETIME'"' >> cc-wrapper
+          echo 'clang "$@"' >> cc-wrapper
+          
+          #创建 LD (链接器) 包装器
+          echo '#!/bin/bash' > ld-wrapper
+          echo 'export LD_PRELOAD="'$PRELOAD_LIBS'"' >> ld-wrapper
+          echo 'export FAKESTAT="'$FAKESTAT'"' >> ld-wrapper
+          echo 'export FAKETIME="'$FAKETIME'"' >> ld-wrapper
+          echo 'ld.lld "$@"' >> ld-wrapper
+          
+          # 测试时间劫持
+          echo "--- [Wrapper Test] 正在创建通用的时间劫持测试脚本 ---"
+          echo '#!/bin/bash' > test-wrapper.sh
+          echo 'export LD_PRELOAD="'$PRELOAD_LIBS'"' >> test-wrapper.sh
+          echo 'export FAKESTAT="'$FAKESTAT'"' >> test-wrapper.sh
+          echo 'export FAKETIME="'$FAKETIME'"' >> test-wrapper.sh
+          echo 'echo ">>> Wrapper 内部环境检查完毕."' >> test-wrapper.sh
+          echo 'exec "$@"' >> test-wrapper.sh
+          chmod +x test-wrapper.sh
+          echo "--- [Wrapper Test] 正在测试 (date) 命令 ---"
+          ./test-wrapper.sh date
+          echo "--- [Wrapper Test] 正在测试 (stat) 命令 ---"
+          ./test-wrapper.sh stat ./Makefile
+          echo "--- [Wrapper Test] 测试完毕 ---"
+          chmod +x cc-wrapper ld-wrapper
+          echo "--- 编译前环境时间: $(LD_PRELOAD=$PRELOAD_LIBS date) ---"
+          echo "--- 编译前环境文件时间戳: ---"
+          LD_PRELOAD=$PRELOAD_LIBS stat ./Makefile
+          
+          # 清理空间
+          sudo rm -rf /usr/share/dotnet &
+          sudo rm -rf /usr/local/lib/android &
+          sudo rm -rf /opt/ghc &
+          sudo rm -rf /opt/hostedtoolcache/CodeQL &
+          # 编译命令移除ccache
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="clang" LD="ld.lld" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error gki_defconfig &&
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error Image
           
+          # 编译后校验
+          echo "--- 编译后环境时间: $(LD_PRELOAD=$PRELOAD_LIBS date) ---"
+          echo "--- 编译后环境文件时间戳: ---"
+          LD_PRELOAD=$PRELOAD_LIBS stat ./Makefile
           echo "内核编译完成！"
-
-      - name: 克隆AnyKernel3并打包（后缀H）
+          # 移除ccache状态输出
+          echo "编译后空间:"
+          df -h
+         
+      - name: 克隆 AnyKernel3 并打包
         run: |
           cd kernel_workspace
-          git clone https://github.com/cctv18/AnyKernel3 --depth=1 && rm -rf ./AnyKernel3/.git
+          git clone https://github.com/cctv18/AnyKernel3 --depth=1
+          rm -rf ./AnyKernel3/.git
           cd AnyKernel3
-          cp ../common/out/arch/arm64/boot/Image ./Image || { echo "未找到内核镜像！"; exit 1; }
-          zip -r ../AnyKernel3_SukiSU_${{ env.KSUVER }}_${{ env.KERNEL_VERSION }}_A15_H.zip ./*
+          cp ../common/out/arch/arm64/boot/Image ./Image
+          if [[ ! -f ./Image ]]; then
+            echo "未找到内核镜像文件，构建可能出错"
+            exit 1
+          fi
+          KSU_TYPENAME="SukiSU"
+          if [[ -n "${{ github.event.inputs.kernel_suffix }}" ]]; then
+            zip -r ../AnyKernel3_${KSU_TYPENAME}_${{ env.KSUVER }}_${{ env.KERNEL_VERSION }}_A15_${{ github.event.inputs.kernel_suffix }}.zip ./*
+          else
+            zip -r ../AnyKernel3_${KSU_TYPENAME}_${{ env.KSUVER }}_${{ env.KERNEL_VERSION }}_A15_${{ env.KERNEL_NAME }}.zip ./*
+          fi
 
-      - name: 上传ZIP工件
+      - name: 上传 ZIP 工件
         uses: actions/upload-artifact@v4
         with:
           name: Kernel_ZIP_Artifacts
@@ -223,34 +371,70 @@ jobs:
       actions: read
       
     steps:
-      - name: 下载ZIP工件
+      - name: 下载 ZIP 工件
         uses: actions/download-artifact@v4
         with:
           name: Kernel_ZIP_Artifacts
           path: ./release_zips
 
-      - name: 设置发布变量
+      - name: 设置环境变量
         run: |
-          FULL_VERSION=${{ format('{0}.118-H', env.KERNEL_VERSION) }}
-          echo "FULL_VERSION=$FULL_VERSION" >> $GITHUB_ENV
-          echo "TIME=$(TZ='Asia/Shanghai' date +'%y%m%d%H%M%S')" >> $GITHUB_ENV
-          echo "TIME_FORM=$(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S')" >> $GITHUB_ENV
-
+          if [[ -n "${{ github.event.inputs.kernel_suffix }}" ]]; then
+            FULL_VERSION=${{ format('{0}.118-{1}', env.KERNEL_VERSION, github.event.inputs.kernel_suffix) }}
+            echo "FULL_VERSION=$FULL_VERSION" >> $GITHUB_ENV
+            export FULL_VERSION=$FULL_VERSION
+          else
+            FULL_VERSION=${{ format('{0}.118-{1}', env.KERNEL_VERSION, env.KERNEL_NAME) }}
+            echo "FULL_VERSION=$FULL_VERSION" >> $GITHUB_ENV
+            export FULL_VERSION=$FULL_VERSION
+          fi
+          TIME="$(TZ='Asia/Shanghai' date +'%y%m%d%H%M%S')"
+          TIME_FORM="$(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S')"
+          echo "TIME=$TIME" >> $GITHUB_ENV
+          echo "TIME_FORM=$TIME_FORM" >> $GITHUB_ENV
+          TAG_HEAD="OPPO+OPlus+Realme-A15-build"
+          echo "TAG_HEAD=$TAG_HEAD" >> $GITHUB_ENV
+          KSU_TYPENAME="SukiSU Ultra"
+          echo "KSU_TYPENAME=$KSU_TYPENAME" >> $GITHUB_ENV
+          if [[ "${{ github.event.inputs.lz4_enable }}" == "1" ]]; then
+            lz4_enable="true"
+          else
+            lz4_enable="false"
+          fi
+          if [[ "${{ github.event.inputs.ssg_rekernel_enable }}" == "1" ]]; then
+            ssg_rekernel_enable="true"
+          else
+            ssg_rekernel_enable="false"
+          fi
+          echo "lz4_enable=$lz4_enable" >> $GITHUB_ENV
+          echo "ssg_rekernel_enable=$ssg_rekernel_enable" >> $GITHUB_ENV
+         
       - name: 创建发布
+        id: create_release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: "OPPO+OPlus+Realme-A15-build-${{ env.TIME }}"
-          name: "OPPO+OPlus+Realme-A15-build-${{ env.FULL_VERSION }}"
+          tag_name: "${{ env.TAG_HEAD }}-${{ env.TIME }}"
+          name: "${{ env.TAG_HEAD }}-${{ env.FULL_VERSION }}"
           body: |
+            ### 📱 欧加真 Android 15 SukiSU Ultra SM8650 通用内核 | 构建信息
             - 内核版本号: ${{ env.FULL_VERSION }}
             - 编译时间: ${{ env.TIME_FORM }}
-            - 机型：欧加真骁龙8Gen3 6.1.118内核通用
-            - 已启用功能：
-              1. SukiSU Ultra 最新版本（${{ needs.build.outputs.ksuver }}）
-              2. LZ4 1.10.0 压缩支持
-              3. 网络功能增强
-              4. 三星SSG IO调度器+Re-Kernel
-              5. BBG
+            - 机型：欧加真骁龙8Gen3 6.1.118 Android 14内核通用（基于一加12 6.1.118 Android 15 版官方OKI源码）
+            - KSU分支：${{ env.KSU_TYPENAME }}
+            - LZ4支持：${{ env.lz4_enable }}
+            - 网络功能增强：${{ github.event.inputs.better_net }}
+            - 三星SSG IO调度器+Re-Kernel支持：${{ env.ssg_rekernel_enable }}
+            - 内核级基带保护支持：${{ github.event.inputs.baseband_guard }}
+            - SukiSU Ultra管理器下载：[SukiSU-Ultra](https://github.com/SukiSU-Ultra/SukiSU-Ultra/releases)
+            ### ⏫️ 更新内容：
+            - 更新${{ env.KSU_TYPENAME }}至最新版本（${{ needs.build.outputs.ksuver }}）
+            - 移除所有SUSFS相关配置
+            - 移除ccache及日志相关配置
+            ### 📋 安装方法 | Installation Guide
+            1. 若你的手机已经安装了第三方Recovery（如TWRP)，可下载对应机型的AnyKernel刷机包后进入Recovery模式，通过Recovery刷入刷机包后重启设备
+            2. 若你的手机之前已有 root 权限，可在手机上安装[HorizonKernelFlasher](https://github.com/libxzr/HorizonKernelFlasher/releases)，在HorizonKernelFlasher中刷入AnyKernel刷机包并重启
+            3. 若你之前已刷入SukiSU Ultra内核，且SukiSU Ultra管理器已更新至最新版本，可在SukiSU Ultra管理器中直接刷入AnyKernel刷机包并重启
+            #### ※※※刷写内核有风险，为防止出现意外导致手机变砖，在刷入内核前请务必用[KernelFlasher](https://github.com/capntrips/KernelFlasher)等软件备份boot等关键启动分区!※※※
           draft: false
           prerelease: false
           files: |
