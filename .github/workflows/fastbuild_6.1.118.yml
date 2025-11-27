@@ -10,15 +10,15 @@ on:
   workflow_dispatch:
     inputs:
       lz4_enable:
-        description: '是否安装 lz4 1.10.0 补丁(0=不安装,1=安装lz4补丁,默认1)'
+        description: '是否安装lz4补丁'
         required: true
         type: choice
-        default: '1'
+        default: 'true'
         options:
-          - '0'
-          - '1'
+          - 'false'
+          - 'true'
       better_net:
-        description: '是否开启网络功能拓展配置(用于为ipset及需要iptables等高级网络功能内核支持的程序提供支持)'
+        description: '是否开启网络功能拓展配置'
         required: true
         type: choice
         default: 'true'
@@ -26,23 +26,23 @@ on:
           - 'true'
           - 'false'
       ssg_rekernel_enable:
-        description: '是否启用三星SSG IO调度器及Re-Kernel支持(0=均不安装,1=均安装,默认1)'
+        description: '是否启用三星SSG IO调度器及Re-Kernel支持'
         required: true
         type: choice
-        default: '1'
+        default: 'true'
         options:
-          - '0'
-          - '1'
+          - 'false'
+          - 'true'
       baseband_guard:
-        description: '是否开启内核级基带保护(阻止一切对非用户分区的写入，有效防止格机)'
+        description: '是否开启BBG'
         required: true
         type: boolean
         default: 'true'
       kernel_suffix:
-        description: '内核后缀(留空默认,开头别加连字符,勿加空格等影响指令运行的保留字符)'
+        description: '内核后缀'
         required: false
         type: string
-        default: ''
+        default: 'H'
 
 jobs:
   build:
@@ -136,10 +136,10 @@ jobs:
           grep "KSU_VERSION_FULL" kernel/Makefile
           echo "SukiSU版本号: v${KSU_API_VERSION}-${GIT_COMMIT_HASH}@cctv18"
 
-      - name: 应用lz4 1.10.0补丁
+      - name: 应用lz4补丁
         run: |
-          if [[ "${{ github.event.inputs.lz4_enable }}" == "1" ]]; then
-            echo "正在添加lz4 1.10.0补丁…"
+          if [[ "${{ github.event.inputs.lz4_enable }}" == "true" ]]; then
+            echo "正在添加lz4补丁…"
             cd kernel_workspace
             git clone https://github.com/cctv18/oppo_oplus_realme_sm8650.git
             cp ./oppo_oplus_realme_sm8650/zram_patch/001-lz4.patch ./common/
@@ -197,7 +197,7 @@ jobs:
 
       - name: 启用三星SSG IO调度器
         run: |
-          if [[ "${{ github.event.inputs.ssg_rekernel_enable }}" == "1" ]]; then
+          if [[ "${{ github.event.inputs.ssg_rekernel_enable }}" == "true" ]]; then
             echo "正在启用三星SSG IO调度器(一加12等极少数机型开启后可能不开机,若出现bug请关闭此项)…"
             cd kernel_workspace
             echo "CONFIG_MQ_IOSCHED_SSG=y" >> ./common/arch/arm64/configs/gki_defconfig
@@ -206,7 +206,7 @@ jobs:
 
       - name: 启用Re-Kernel支持
         run: |
-          if [[ "${{ github.event.inputs.ssg_rekernel_enable }}" == "1" ]]; then
+          if [[ "${{ github.event.inputs.ssg_rekernel_enable }}" == "true" ]]; then
             echo "正在启用Re-Kernel支持(用于与Freezer,NoActive等软件配合使用,提升冻结后台能力)…"
             cd kernel_workspace
             echo "CONFIG_REKERNEL=y" >> ./common/arch/arm64/configs/gki_defconfig
@@ -275,7 +275,6 @@ jobs:
           echo "LLD版本: $LLD_VERSION"
           pahole_version=$(pahole --version 2>/dev/null | head -n1); [ -z "$pahole_version" ] && echo "pahole版本：未安装" || echo "pahole版本：$pahole_version"
           
-          # 移除所有ccache相关环境变量
           cd kernel_workspace/common
           wget https://github.com/cctv18/oppo_oplus_realme_sm8650/raw/refs/heads/main/lib/libfakestat.so
           wget https://github.com/cctv18/oppo_oplus_realme_sm8650/raw/refs/heads/main/lib/libfaketimeMT.so
@@ -287,7 +286,7 @@ jobs:
           SO_DIR=$(pwd)
           export PRELOAD_LIBS="$SO_DIR/libfakestat.so $SO_DIR/libfaketimeMT.so"
           
-          #创建 CC (编译器) 包装器（移除ccache）
+          #创建 CC (编译器) 包装器
           echo '#!/bin/bash' > cc-wrapper
           echo 'export LD_PRELOAD="'$PRELOAD_LIBS'"' >> cc-wrapper
           echo 'export FAKESTAT="'$FAKESTAT'"' >> cc-wrapper
@@ -396,16 +395,8 @@ jobs:
           echo "TAG_HEAD=$TAG_HEAD" >> $GITHUB_ENV
           KSU_TYPENAME="SukiSU Ultra"
           echo "KSU_TYPENAME=$KSU_TYPENAME" >> $GITHUB_ENV
-          if [[ "${{ github.event.inputs.lz4_enable }}" == "1" ]]; then
-            lz4_enable="true"
-          else
-            lz4_enable="false"
-          fi
-          if [[ "${{ github.event.inputs.ssg_rekernel_enable }}" == "1" ]]; then
-            ssg_rekernel_enable="true"
-          else
-            ssg_rekernel_enable="false"
-          fi
+          lz4_enable="${{ github.event.inputs.lz4_enable }}"
+          ssg_rekernel_enable="${{ github.event.inputs.ssg_rekernel_enable }}"
           echo "lz4_enable=$lz4_enable" >> $GITHUB_ENV
           echo "ssg_rekernel_enable=$ssg_rekernel_enable" >> $GITHUB_ENV
          
@@ -416,25 +407,15 @@ jobs:
           tag_name: "${{ env.TAG_HEAD }}-${{ env.TIME }}"
           name: "${{ env.TAG_HEAD }}-${{ env.FULL_VERSION }}"
           body: |
-            ### 📱 欧加真 Android 15 SukiSU Ultra SM8650 通用内核 | 构建信息
             - 内核版本号: ${{ env.FULL_VERSION }}
             - 编译时间: ${{ env.TIME_FORM }}
-            - 机型：欧加真骁龙8Gen3 6.1.118 Android 14内核通用（基于一加12 6.1.118 Android 15 版官方OKI源码）
+            - 机型：欧加真骁龙8Gen3 6.1.118内核通用
             - KSU分支：${{ env.KSU_TYPENAME }}
             - LZ4支持：${{ env.lz4_enable }}
             - 网络功能增强：${{ github.event.inputs.better_net }}
             - 三星SSG IO调度器+Re-Kernel支持：${{ env.ssg_rekernel_enable }}
             - 内核级基带保护支持：${{ github.event.inputs.baseband_guard }}
             - SukiSU Ultra管理器下载：[SukiSU-Ultra](https://github.com/SukiSU-Ultra/SukiSU-Ultra/releases)
-            ### ⏫️ 更新内容：
-            - 更新${{ env.KSU_TYPENAME }}至最新版本（${{ needs.build.outputs.ksuver }}）
-            - 移除所有SUSFS相关配置
-            - 移除ccache及日志相关配置
-            ### 📋 安装方法 | Installation Guide
-            1. 若你的手机已经安装了第三方Recovery（如TWRP)，可下载对应机型的AnyKernel刷机包后进入Recovery模式，通过Recovery刷入刷机包后重启设备
-            2. 若你的手机之前已有 root 权限，可在手机上安装[HorizonKernelFlasher](https://github.com/libxzr/HorizonKernelFlasher/releases)，在HorizonKernelFlasher中刷入AnyKernel刷机包并重启
-            3. 若你之前已刷入SukiSU Ultra内核，且SukiSU Ultra管理器已更新至最新版本，可在SukiSU Ultra管理器中直接刷入AnyKernel刷机包并重启
-            #### ※※※刷写内核有风险，为防止出现意外导致手机变砖，在刷入内核前请务必用[KernelFlasher](https://github.com/capntrips/KernelFlasher)等软件备份boot等关键启动分区!※※※
           draft: false
           prerelease: false
           files: |
